@@ -1,16 +1,16 @@
-LA-KD: Lesion-Aware Knowledge Distillation for Plant Disease Classification
-Overview
+##LA-KD: Lesion-Aware Knowledge Distillation for Plant Disease Classification
+##Overview
 
 LA-KD is a lesion-aware knowledge distillation framework designed for efficient plant disease classification in complex real-field environments. The framework employs an ensemble teacher network to transfer disease-relevant knowledge into a lightweight student network through lesion-aware supervision, enabling accurate and computationally efficient deployment on edge devices.
 
-Key Features
+##Key Features
 Ensemble teacher network combining CNN and Swin Transformer V2.
 Lightweight student network (RTDF-Net).
 Lesion-Aware Knowledge Distillation (LA-KD).
 Lesion-Weighted Knowledge Distillation (LWKD).
 Lesion Patch-Level Contrastive Distillation (LPCD).
 Designed for consumer-oriented agricultural edge applications.
-Repository Structure
+##Repository Structure
 LA-KD/
 │
 ├── Teacher/
@@ -24,11 +24,11 @@ LA-KD/
 │
 ├── README.md
 └── requirements.txt
-Framework
+##Framework
 
 The proposed framework consists of:
 
-Teacher Network
+##Teacher Network
 
 The teacher model combines:
 
@@ -37,7 +37,7 @@ Global Feature Extractor (Swin Transformer V2)
 
 The extracted features are fused to generate discriminative disease representations.
 
-Student Network (RTDF-Net)
+##Student Network (RTDF-Net)
 
 RTDF-Net is a lightweight architecture containing:
 
@@ -47,7 +47,7 @@ Cosine Margin Head
 
 The network is designed for efficient deployment on resource-constrained devices.
 
-LA-KD Loss
+##LA-KD Loss
 
 The total training objective is:
 
