@@ -1,23 +1,68 @@
-# RTDF-Net
+LA-KD: Lesion-Aware Knowledge Distillation for Plant Disease Classification
+Overview
 
-Official implementation of RTDF-Net for plant disease classification.
+LA-KD is a lesion-aware knowledge distillation framework designed for efficient plant disease classification in complex real-field environments. The framework employs an ensemble teacher network to transfer disease-relevant knowledge into a lightweight student network through lesion-aware supervision, enabling accurate and computationally efficient deployment on edge devices.
 
-## Overview
+Key Features
+Ensemble teacher network combining CNN and Swin Transformer V2.
+Lightweight student network (RTDF-Net).
+Lesion-Aware Knowledge Distillation (LA-KD).
+Lesion-Weighted Knowledge Distillation (LWKD).
+Lesion Patch-Level Contrastive Distillation (LPCD).
+Designed for consumer-oriented agricultural edge applications.
+Repository Structure
+LA-KD/
+│
+├── Teacher/
+│   └── Teacher network implementation
+│
+├── Student/
+│   └── RTDF-Net implementation
+│
+├── Loss/
+│   └── LA-KD loss functions
+│
+├── README.md
+└── requirements.txt
+Framework
 
-RTDF-Net is a lightweight deep learning framework designed for accurate plant disease classification on resource-constrained devices. The model integrates:
+The proposed framework consists of:
 
-- Multi-scale feature extraction
-- Frequency-domain learning
-- Adaptive feature fusion
-- Lightweight knowledge distillation
+Teacher Network
 
-## Dataset
+The teacher model combines:
 
-The experiments were conducted on:
+Local Feature Extractor (CNN)
+Global Feature Extractor (Swin Transformer V2)
 
-- SCLD Dataset: "Daphal, Swapnil; Koli, Sanjay (2022), “Sugarcane Leaf Disease Dataset”, Mendeley Data, V1, doi: 10.17632/9424skmnrk.1"
-- DLID Dataset: "Thanh Truong, Nguyen; Xuan Linh, Nguyen; Thang, Cap Pham Dinh; Tuong, Le (2025), “A Durian Leaf Image Dataset of Common Diseases in Vietnam for Agricultural Diagnosis ”, Mendeley Data, V4, doi: 10.17632/pxzvksbwnj.4"
+The extracted features are fused to generate discriminative disease representations.
 
-Please download the datasets from their official sources.
+Student Network (RTDF-Net)
 
+RTDF-Net is a lightweight architecture containing:
 
+Tri-Domain Fusion (TDF)
+Weighted Contextual Routing (WCR)
+Cosine Margin Head
+
+The network is designed for efficient deployment on resource-constrained devices.
+
+LA-KD Loss
+
+The total training objective is:
+
+[
+L = \omega_S L_{CE} + \omega_L L_{LAKD} + \omega_C L_{LPCD}
+]
+
+where:
+
+(L_{CE}): Cross-Entropy Loss
+(L_{LAKD}): Lesion-Aware Knowledge Distillation Loss
+(L_{LPCD}): Lesion Patch-Level Contrastive Distillation Loss
+
+Default weights:
+
+ωS = 0.5
+ωL = 0.3
+ωC = 0.2
