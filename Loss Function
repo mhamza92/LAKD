@@ -1,0 +1,222 @@
+# ---------- shared utils (kept small) ----------
+def _entropy_from_logits_map(logits, T=1.0, dim=1, eps=1e-8):
+    # logits: (B,K,H,W) -> (B,1,H,W)
+    p = F.softmax(logits / T, dim=dim)
+    h = -(p * (p.add(eps).log())).sum(dim=dim, keepdim=True)
+    return h
+
+def _attn_energy(x, eps=1e-8):
+    # (B,C,H,W) -> (B,1,H,W), normalized energy
+    A = x.pow(2).mean(dim=1, keepdim=True)
+    return A / (A.sum(dim=(2,3), keepdim=True) + eps)
+
+def _minmax01(t, eps=1e-8):
+    B, C, H, W = t.shape
+    vmin = t.view(B, -1).min(dim=1)[0].view(B,1,1,1)
+    vmax = t.view(B, -1).max(dim=1)[0].view(B,1,1,1)
+    return (t - vmin) / (vmax - vmin + eps)
+
+def _cosine_logit_map(feat_map, cos_head):
+    # feat_map: (B,C,H,W) -> (B,K,H,W) via student's cosine head weights
+    B, C, H, W = feat_map.shape
+    Xn = F.normalize(feat_map, dim=1)
+    Wn = F.normalize(cos_head.weight, dim=1).view(-1, C, 1, 1)  # (K,C,1,1)
+    s  = cos_head.s if hasattr(cos_head, "s") else 30.0
+    return F.conv2d(Xn, Wn) * s
+
+
+
+def _lesion_mask_from_teacher(t_map, t_feat, p_keep, lap):
+    # combine (1-entropy) x attention x high-frequency
+    Hloc = _entropy_from_logits_map(t_map, T=1.0, dim=1)   # (B,1,H,W)
+    Att  = _attn_energy(t_feat)                            # (B,1,H,W)
+
+    g  = t_feat.mean(dim=1, keepdim=True)
+    HF = F.conv2d(g, lap, padding=1).abs()
+
+    Hn  = 1.0 - _minmax01(Hloc)
+    An  = _minmax01(Att)
+    HFn = _minmax01(HF)
+    score = Hn * An * HFn                                  # (B,1,H,W)
+
+    # top p_keep% per sample
+    B, _, H, W = score.shape
+    k_per = max(1, int(p_keep * H * W))
+    flat = score.view(B, -1)
+    thr_vals = torch.topk(flat, k_per, dim=1).values[:, -1].view(B,1,1,1)
+    mask = (score >= thr_vals).float()
+    return score, mask
+
+# ---------- Lesion-weighted Local KD (uses ONLY teacher fused map) ----------
+class LesionLocalKDLoss(nn.Module): #LWKD
+    """
+    KL between teacher & student spatial class maps, emphasized on lesion pixels.
+    Uses student's cosine head. Teacher feature must be the ALREADY-FUSED spatial map.
+
+    Args:
+        p_keep: fraction of top lesion pixels to keep (per-image)
+        T_local: temperature for spatial KL
+        bg_gamma: optional weight to include background pixels
+    """
+    def __init__(self, p_keep, T_local, bg_gamma):
+        super().__init__()
+        self.p_keep  = p_keep
+        self.T_local = T_local
+        self.bg_gamma = bg_gamma
+        k = torch.tensor([[0., 1., 0.],
+                          [1.,-4., 1.],
+                          [0., 1., 0.]], dtype=torch.float32).view(1,1,3,3)
+        self.register_buffer("lap", k, persistent=False)
+
+    @staticmethod
+    def _rowwise_kl(t_logits, s_logits, T):
+        log_pt = F.log_softmax(t_logits / T, dim=1); pt = log_pt.exp()
+        log_ps = F.log_softmax(s_logits / T, dim=1)
+        return (pt * (log_pt - log_ps)).sum(dim=1) * (T * T)  # [N]
+
+    def forward(self, s_feat_map, s_cos_head, t_fused_feat):
+        """
+        s_feat_map:  (B, C, Hs, Ws)  student spatial feature map
+        s_cos_head:  CosineMarginHead (student's head) to build class logit maps
+        t_fused_feat:(B, C, Ht, Wt)  teacher's ALREADY-FUSED spatial map
+        """
+        target_hw = s_feat_map.shape[-2:]
+
+        # 1) resize teacher fused map to student's spatial size
+        t_feat = F.interpolate(t_fused_feat, size=target_hw, mode='bilinear', align_corners=False)
+
+        # 2) spatial class logits (use student's cosine head weights)
+        s_map = _cosine_logit_map(s_feat_map, s_cos_head)  # (B,K,H,W)
+        t_map = _cosine_logit_map(t_feat,     s_cos_head)  # (B,K,H,W)
+
+        # 3) lesion mask from teacher fused feature
+        _, lesion_mask = _lesion_mask_from_teacher(t_map, t_feat, self.p_keep, self.lap)
+
+        # 4) pixelwise KL on lesion, optionally background
+        B, K, H, W = s_map.shape
+        sr = s_map.permute(0,2,3,1).reshape(-1, K)
+        tr = t_map.permute(0,2,3,1).reshape(-1, K)
+        kl = self._rowwise_kl(tr, sr, self.T_local)                # (BHW,)
+
+        m  = lesion_mask.view(-1)
+        num = (kl * m).sum() / m.sum().clamp_min(1.0)
+
+        if self.bg_gamma > 0:
+            mb = (1.0 - m)
+            bg = (kl * mb).sum() / mb.sum().clamp_min(1.0)
+        else:
+            bg = kl.new_tensor(0.0)
+
+        loss = num + self.bg_gamma * bg
+        return loss, {"lesion_cov": lesion_mask.mean().detach()}
+
+# ---------- Part B (FUSED): Lesion Patch Contrastive (InfoNCE) ----------
+class LesionPatchContrastLossFused(nn.Module): #LPCD
+    """
+    Contrast student vs teacher embeddings on lesion pixels using the teacher's
+    ALREADY-FUSED spatial feature map (t_fused_feat).
+
+    Args:
+        p_keep:      top-p fraction of pixels per image to treat as lesions
+        patch_pool:  local average pooling window (keeps spatial size)
+        max_patches: cap number of lesion pixels per image for contrast
+        tau:         temperature for InfoNCE
+    """
+    def __init__(self, p_keep, patch_pool, max_patches, tau):
+        super().__init__()
+        self.p_keep = p_keep
+        self.patch_pool  = patch_pool
+        self.max_patches = max_patches
+        self.tau = tau
+
+        k = torch.tensor([[0., 1., 0.],
+                          [1.,-4., 1.],
+                          [0., 1., 0.]], dtype=torch.float32).view(1,1,3,3)
+        self.register_buffer("lap", k, persistent=False)
+
+    def forward(self, s_feat_map, t_fused_feat, s_cos_head=None):
+        """
+        s_feat_map  : (B,C,Hs,Ws)  student spatial feature map
+        t_fused_feat: (B,C,Ht,Wt)  teacher fused spatial map from CombinedModel
+        s_cos_head  : (optional) student's cosine head to build a better mask
+        """
+        # 1) align teacher feature to student's spatial size
+        target_hw = s_feat_map.shape[-2:]
+        t_feat = F.interpolate(t_fused_feat, size=target_hw,
+                               mode='bilinear', align_corners=False)
+
+        # 2) build lesion mask from fused teacher
+        with torch.no_grad():
+            if s_cos_head is not None:
+                t_map = _cosine_logit_map(t_feat, s_cos_head)  # (B,K,H,W)
+            else:
+                # fallback: pseudo 2-class map from feature energy
+                t_map = t_feat.mean(dim=1, keepdim=True).repeat(1, 2, *target_hw)
+            _, lesion_mask = _lesion_mask_from_teacher(t_map, t_feat, self.p_keep, self.lap)  # (B,1,H,W)
+
+        # 3) light local pooling to stabilize contrast on patches
+        s_p = F.avg_pool2d(s_feat_map, kernel_size=self.patch_pool,
+                           stride=1, padding=self.patch_pool//2)
+        t_p = F.avg_pool2d(t_feat,     kernel_size=self.patch_pool,
+                           stride=1, padding=self.patch_pool//2)
+
+        # 4) InfoNCE across lesion pixels (per-image)
+        B, C, H, W = s_p.shape
+        loss_sum = s_feat_map.new_zeros(())
+        count = 0
+        for b in range(B):
+            m = lesion_mask[b, 0]  # (H,W)
+            idx = torch.nonzero(m, as_tuple=False)
+            if idx.numel() == 0:
+                continue
+            if idx.size(0) > self.max_patches:
+                perm = torch.randperm(idx.size(0), device=idx.device)[:self.max_patches]
+                idx = idx[perm]
+            yy, xx = idx[:, 0], idx[:, 1]
+
+            s_sel = s_p[b, :, yy, xx].t()  # (N,C)
+            t_sel = t_p[b, :, yy, xx].t()  # (N,C)
+
+            s_n = F.normalize(s_sel, dim=1)
+            t_n = F.normalize(t_sel, dim=1)
+
+            logits = (s_n @ t_n.t()) / self.tau   # (N,N), positives on the diagonal
+            labels = torch.arange(logits.size(0), device=logits.device)
+            loss_sum = loss_sum + F.cross_entropy(logits, labels)
+            count += 1
+
+        loss = loss_sum / max(1, count)
+        return loss, {"num_patches_batches": torch.tensor(count, device=loss_sum.device)}
+
+# ---------- Optional: wrapper to combine parts ----------
+class CombinedLeaFDLoss(nn.Module): #LA-KD
+    def __init__(self,
+                 local_loss=None,
+                 contrast_loss=None,
+                 w_local=0.3, w_contrast=0.2):   
+        super().__init__()
+        self.local_loss    = local_loss
+        self.contrast_loss = contrast_loss
+        self.w_local    = w_local
+        self.w_contrast = w_contrast
+
+
+    def forward(self, s_feat_map, s_cos_head, t_fused_feat, w_overrides=None):
+        # allow dynamic weights (e.g., ramp for freq)
+        w_local    = self.w_local    if w_overrides is None else w_overrides.get("w_local", self.w_local)
+        w_contrast = self.w_contrast if w_overrides is None else w_overrides.get("w_contrast", self.w_contrast)
+        total = s_feat_map.new_tensor(0.0)
+        logs = {}
+
+        if self.local_loss is not None and w_local > 0:
+            L, lg = self.local_loss(s_feat_map, s_cos_head, t_fused_feat)
+            total = total + w_local * L
+            logs.update({f"local_{k}": v for k,v in lg.items()})
+            logs["L_local"] = L.detach()
+
+        if self.contrast_loss is not None and w_contrast > 0:
+            L, lg = self.contrast_loss(s_feat_map, t_fused_feat, s_cos_head)
+            total = total + w_contrast * L
+            logs.update({f"contrast_{k}": v for k,v in lg.items()})
+            logs["L_contrast"] = L.detach()
+        return total, logs
