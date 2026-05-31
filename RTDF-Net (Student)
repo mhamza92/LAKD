@@ -1,0 +1,304 @@
+
+# student model
+from pytorch_wavelets import DWTForward, DWTInverse
+import torch.optim as optim
+
+
+# Prompt-Guided Router (PGR)
+class PromptGuidedRouter(nn.Module):
+    """
+    Replaces GAP->MLP softmax in MGIF with prompt-driven routing.
+    - Keeps params tiny: prompts (K x C), and a small mapper to 3 branch weights.
+    - Cosine-sim from pooled token to prompt bank => soft attention over prompts.
+    - Aggregated prompt vector -> 3-way gating (pixel/local/global).
+    """
+
+    def __init__(self, channels, num_prompts=16, hidden=64):  # on the first attempt num_promts= 8 Now changing to 16
+        super().__init__()
+        self.num_prompts = num_prompts
+        # Prompt bank: learnable "instruction" vectors
+        self.prompts = nn.Parameter(torch.randn(num_prompts, channels))
+        nn.init.normal_(self.prompts, std=0.02)
+
+        # Map aggregated prompt context -> 3 weights
+        self.mapper = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 3)
+        )
+
+    def forward(self, x):  # x: (B, C, H, W) after fusion sum or pooled token producer
+        B, C, H, W = x.shape
+        # global token
+        g = F.adaptive_avg_pool2d(x, 1).flatten(1)  # (B, C)
+        # cosine sim to prompt bank
+        g_n = F.normalize(g, dim=1)  # (B, C)
+        p_n = F.normalize(self.prompts, dim=1)  # (K, C)
+        sim = torch.matmul(g_n, p_n.t()) / 0.07  # (B, K) --> changing the sim by adding temperature temperature τ=0.07
+        a = F.softmax(sim, dim=1)  # prompt attention
+        # aggregate prompt vector
+        p_ctx = torch.matmul(a, self.prompts)  # (B, C)
+        w = self.mapper(p_ctx)  # (B, 3)
+        w = F.softmax(w, dim=1).view(B, 3, 1, 1)  # (B,3,1,1)
+        return w[:, 0:1], w[:, 1:2], w[:, 2:3]  # wa, wb, wc
+
+
+class GlobalDWTBranch(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(GlobalDWTBranch, self).__init__()
+        self.dwt = DWTForward(J=1, wave='haar')
+        self.idwt = DWTInverse(wave='haar')
+
+        self.project_in = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+
+        self.dwconv_ll = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels),
+        )
+
+        self.dwconv_hh = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels),
+        )
+
+    def forward(self, x):
+        x = self.project_in(x)  # Ensure correct number of channels before DWT
+        Yl, Yh = self.dwt(x)
+        LH = Yh[0][:, :, 0, :, :]
+        HL = Yh[0][:, :, 1, :, :]
+        HH = Yh[0][:, :, 2, :, :]
+
+        # Low  level path
+        Yl_mod = self.dwconv_ll(Yl)
+
+        # High-bands path with dir-attn + shrinkage
+        # original saved model 4
+        HH_combined = (LH + HL + HH) / 3.0
+        HH_mod = self.dwconv_hh(HH_combined)
+
+        Yh_mod = torch.stack([HH_mod, HH_mod, HH_mod], dim=2)
+        out = self.idwt((Yl_mod, [Yh_mod]))
+        return out
+
+
+class MGIFBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, num_prompts=8):
+        super().__init__()
+
+        self.pixel_branch = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        self.local_branch = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        self.global_branch = GlobalDWTBranch(in_channels, out_channels)
+
+        # self.gap_fc = nn.Sequential(
+        #     nn.AdaptiveAvgPool2d(1),
+        #     nn.Conv2d(out_channels, out_channels // 4, 1),
+        #     nn.ReLU(),
+        #     nn.Conv2d(out_channels // 4, 3, 1),
+        #     nn.Softmax(dim=1)
+        # )
+        # I am replacing gap_FC with PromptguiderRouter
+
+        # ✨ New: prompt-guided router instead of GAP->conv->softmax(3)
+        self.router = PromptGuidedRouter(out_channels, num_prompts=num_prompts, hidden=max(32, out_channels // 8))
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        a = self.pixel_branch(x)
+        b = self.local_branch(x)
+        c = self.global_branch(x)
+
+        F_sum = a + b + c
+        # weights = self.gap_fc(F_sum)
+        wa, wb, wc = self.router(F_sum)
+
+        # wa = weights[:, 0:1, :, :]
+        # wb = weights[:, 1:2, :, :]
+        # wc = weights[:, 2:3, :, :]
+
+        fused = a * wa + b * wb + c * wc
+        return self.fuse(fused)
+
+
+# --- Add this class ABOVE CCGICStudentNet ---
+class PrototypeMemory(nn.Module):
+    def __init__(self, feat_dim, num_classes, momentum=0.95):
+        super().__init__()
+        self.num_classes = num_classes
+        self.momentum = momentum
+        self.register_buffer("protos", F.normalize(torch.randn(num_classes, feat_dim), dim=1))
+
+    @torch.no_grad()
+    def update(self, feats, labels):
+        feats = F.normalize(feats, dim=1)
+        for c in range(self.num_classes):
+            m = (labels == c)
+            if m.any():
+                mean_c = F.normalize(feats[m].mean(dim=0, keepdim=True), dim=1)
+                self.protos[c] = F.normalize(
+                    self.momentum * self.protos[c] + (1 - self.momentum) * mean_c[0], dim=0
+                )
+
+    def proto_logits(self, feats, scale=10.0):
+        feats = F.normalize(feats, dim=1)
+        return (feats @ self.protos.t()) * scale
+
+
+# Replace the linear head with a cosine-margin head
+class CosineMarginHead(nn.Module):
+    def __init__(self, feat_dim, num_classes, s=30.0, m=0.35):
+        super().__init__()
+        self.s, self.m = s, m
+        self.weight = nn.Parameter(torch.randn(num_classes, feat_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, feats, labels=None):
+        x = F.normalize(feats, dim=1)
+        w = F.normalize(self.weight, dim=1)
+        logits = x @ w.t()  # cosine logits
+        if self.training and labels is not None:
+            theta = torch.acos(torch.clamp(logits, -1 + 1e-7, 1 - 1e-7))
+            target = torch.cos(theta + self.m)
+            logits = logits.scatter(1, labels.view(-1, 1), target.gather(1, labels.view(-1, 1)))
+        return logits * self.s
+
+
+class FeatureMaping(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.s3_fuse = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=2, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.s3_fuse(x)
+
+        return x
+
+
+class CCGICStudentNet(nn.Module):
+    def __init__(self, num_classes, use_kd_taps=False, use_proto_mem=True):
+        super().__init__()
+        self.use_kd_taps = use_kd_taps
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),  # 112x112
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+
+        self.stage1 = nn.Sequential(
+            MGIFBlock(16, 32),
+            MGIFBlock(32, 32),
+
+            nn.MaxPool2d(2)  # 56x56
+        )
+
+        self.stage2 = nn.Sequential(
+            MGIFBlock(32, 64),
+            MGIFBlock(64, 64),
+            MGIFBlock(64, 64),
+
+            nn.MaxPool2d(2)  # 28x28
+        )
+
+        self.Res1 = FeatureMaping(64, 128)
+        self.stage3 = nn.Sequential(
+            MGIFBlock(64, 128),
+            MGIFBlock(128, 128),
+            MGIFBlock(128, 128),
+            MGIFBlock(128, 128),
+            MGIFBlock(128, 128),
+            MGIFBlock(128, 128),
+
+            nn.MaxPool2d(2)  # 14x14
+        )
+
+        self.stage4 = nn.Sequential(
+            MGIFBlock(128, 160),
+
+            nn.MaxPool2d(2)  # 7x7
+        )
+
+        self.expand = nn.Conv2d(160, 768, kernel_size=1)
+
+        # self.head = nn.Sequential(
+        #     nn.AdaptiveAvgPool2d(1),
+        #     nn.Flatten(),
+        #     nn.Linear(768, num_classes)
+        # )# replacing the normal head with cosine margin head
+        self.head_pool = nn.AdaptiveAvgPool2d(1)
+        self.cos_head = CosineMarginHead(768, num_classes, s=30.0, m=0.20)  # 0.35)
+        self.use_proto_mem = use_proto_mem
+        if use_proto_mem:
+            self.proto_mem = PrototypeMemory(768, num_classes, momentum=0.95)
+        self.use_kd_taps = use_kd_taps
+        if self.use_kd_taps:
+            self.proj_f3 = nn.Conv2d(160, 160, kernel_size=1)
+            self.proj_f4 = nn.Conv2d(768, 768, kernel_size=1)
+
+    def forward(self, x, labels=None, update_memory=False):
+        x = self.stem(x)
+        x = self.stage1(x)
+        hf = x  # High-frequency features from early stage
+
+        x = self.stage2(x)
+        res1 = self.Res1(x)
+        x = self.stage3(x) + res1
+
+        f3 = self.stage4(x)
+
+        f4 = self.expand(f3)
+        pooled = self.head_pool(f4).flatten(1)  # (B,768)
+        cos_logits = self.cos_head(pooled, labels if self.training else None)
+
+
+
+        out = {"cos_logits": cos_logits, "pooled": pooled}
+        out["feat_s4"] = f4  # <-- add this line (B, 768, h, w)
+        if self.use_proto_mem:
+            with torch.no_grad():
+                proto_logits = self.proto_mem.proto_logits(pooled)  # (B,C)
+            out["proto_logits"] = proto_logits
+            out["logits_fused"] = cos_logits + 0.5 * proto_logits
+
+            if self.training and update_memory and (labels is not None):
+                self.proto_mem.update(pooled.detach(), labels.detach())
+
+        if self.use_kd_taps:
+            out["taps"] = {"F3": self.proj_f3(f3), "F4": self.proj_f4(f4), "HF": hf}
+        return out
+
+    def freeze_layers(self):
+        for layer in [
+            self.stem,
+            self.stage1,
+            self.stage2,
+            # self.stage3,
+            # self.stage4,
+        ]:
+            for param in layer.parameters():
+                param.requires_grad = False
+def get_logits(model_out):
+    if isinstance(model_out, dict):
+        return model_out["logits_fused"] if "logits_fused" in model_out else model_out["cos_logits"]
+    return model_out
