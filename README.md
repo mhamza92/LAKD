@@ -47,21 +47,21 @@ The network achieves an effective balance between classification accuracy and co
 
 The overall training objective is defined as:
 
-[
+$$[
 L = \omega_S L_{CE} + \omega_L L_{LAKD} + \omega_C L_{LPCD}
-]
+]$$
 
 where:
 
-* (L_{CE}): Cross-Entropy Loss
-* (L_{LAKD}): Lesion-Aware Knowledge Distillation Loss
-* (L_{LPCD}): Lesion Patch-Level Contrastive Distillation Loss
+* $(L_{CE})$: Cross-Entropy Loss
+* $(L_{LAKD})$: Lesion-Aware Knowledge Distillation Loss
+* $(L_{LPCD})$: Lesion Patch-Level Contrastive Distillation Loss
 
 Default loss weights:
 
-* (\omega_S = 0.5)
-* (\omega_L = 0.3)
-* (\omega_C = 0.2)
+* $(\omega_S = 0.5)$
+* $(\omega_L = 0.3)$
+* $(\omega_C = 0.2)$
 
 ## Applications
 
