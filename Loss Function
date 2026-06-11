@@ -26,7 +26,7 @@ def _cosine_logit_map(feat_map, cos_head):
 
 
 
-def _lesion_mask_from_teacher(t_map, t_feat, p_keep, lap):
+def mask(t_map, t_feat, p_keep, lap):
     # combine (1-entropy) x attention x high-frequency
     Hloc = _entropy_from_logits_map(t_map, T=1.0, dim=1)   # (B,1,H,W)
     Att  = _attn_energy(t_feat)                            # (B,1,H,W)
@@ -47,8 +47,8 @@ def _lesion_mask_from_teacher(t_map, t_feat, p_keep, lap):
     mask = (score >= thr_vals).float()
     return score, mask
 
-# ---------- Lesion-weighted Local KD (uses ONLY teacher fused map) ----------
-class LesionLocalKDLoss(nn.Module): #LWKD
+# ----------part 1 (uses ONLY teacher fused map) ----------
+class LocalKDLoss(nn.Module): 
     """
     KL between teacher & student spatial class maps, emphasized on lesion pixels.
     Uses student's cosine head. Teacher feature must be the ALREADY-FUSED spatial map.
@@ -89,7 +89,7 @@ class LesionLocalKDLoss(nn.Module): #LWKD
         s_map = _cosine_logit_map(s_feat_map, s_cos_head)  # (B,K,H,W)
         t_map = _cosine_logit_map(t_feat,     s_cos_head)  # (B,K,H,W)
 
-        # 3) lesion mask from teacher fused feature
+        # 3) musk from teacher fused feature
         _, lesion_mask = _lesion_mask_from_teacher(t_map, t_feat, self.p_keep, self.lap)
 
         # 4) pixelwise KL on lesion, optionally background
@@ -110,8 +110,8 @@ class LesionLocalKDLoss(nn.Module): #LWKD
         loss = num + self.bg_gamma * bg
         return loss, {"lesion_cov": lesion_mask.mean().detach()}
 
-# ---------- Part B (FUSED): Lesion Patch Contrastive (InfoNCE) ----------
-class LesionPatchContrastLossFused(nn.Module): #LPCD
+# ---------- Part B (FUSED) ----------
+class con_loss(nn.Module): #part 2
     """
     Contrast student vs teacher embeddings on lesion pixels using the teacher's
     ALREADY-FUSED spatial feature map (t_fused_feat).
@@ -119,7 +119,7 @@ class LesionPatchContrastLossFused(nn.Module): #LPCD
     Args:
         p_keep:      top-p fraction of pixels per image to treat as lesions
         patch_pool:  local average pooling window (keeps spatial size)
-        max_patches: cap number of lesion pixels per image for contrast
+        max_patches: cap number of leson pixels per image for contrast
         tau:         temperature for InfoNCE
     """
     def __init__(self, p_keep, patch_pool, max_patches, tau):
@@ -165,7 +165,7 @@ class LesionPatchContrastLossFused(nn.Module): #LPCD
         loss_sum = s_feat_map.new_zeros(())
         count = 0
         for b in range(B):
-            m = lesion_mask[b, 0]  # (H,W)
+            m = lesion_musk[b, 0]  # (H,W)
             idx = torch.nonzero(m, as_tuple=False)
             if idx.numel() == 0:
                 continue
@@ -189,7 +189,7 @@ class LesionPatchContrastLossFused(nn.Module): #LPCD
         return loss, {"num_patches_batches": torch.tensor(count, device=loss_sum.device)}
 
 # ---------- Optional: wrapper to combine parts ----------
-class CombinedLeaFDLoss(nn.Module): #LA-KD
+class Loss(nn.Module): #LA-KD
     def __init__(self,
                  local_loss=None,
                  contrast_loss=None,
