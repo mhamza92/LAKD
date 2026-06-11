@@ -32,7 +32,7 @@ import os
 from torch.nn import init
 
 '''
-  RCA Network Code
+  Customized CNN Network Code
 '''
 
 
