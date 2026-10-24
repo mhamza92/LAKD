@@ -221,7 +221,7 @@ class CCGICStudentNet(nn.Module):
             nn.MaxPool2d(2)  # 28x28
         )
 
-        self.Res1 = FeatureMaping(64, 128)
+       
         self.stage3 = nn.Sequential(
             MGIFBlock(64, 128),
             MGIFBlock(128, 128),
@@ -262,8 +262,8 @@ class CCGICStudentNet(nn.Module):
         hf = x  # High-frequency features from early stage
 
         x = self.stage2(x)
-        res1 = self.Res1(x)
-        x = self.stage3(x) + res1
+        
+        x = self.stage3(x) 
 
         f3 = self.stage4(x)
 
